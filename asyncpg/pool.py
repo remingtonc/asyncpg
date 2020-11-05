@@ -116,22 +116,25 @@ class PoolConnectionHolder:
         self._timeout = None
         self._generation = None
 
-    async def connect(self):
+    async def connect(self, refresh_pool=False):
         if self._con is not None:
             raise exceptions.InternalClientError(
                 'PoolConnectionHolder.connect() called while another '
                 'connection already exists')
 
-        self._con = await self._pool._get_new_connection()
+        self._con = await self._pool._get_new_connection(refresh_pool=refresh_pool)
         self._generation = self._pool._generation
         self._maybe_cancel_inactive_callback()
         self._setup_inactive_callback()
 
     async def acquire(self) -> PoolConnectionProxy:
-        if self._con is None or self._con.is_closed():
-            self._con = None
+        if self._con is None:
+            logging.debug("Acquiring new connection.")
             await self.connect()
-
+        elif self._con.is_closed():
+            logging.debug("Connection is closed, refreshing.")
+            self._con = None
+            await self.connect(refresh_pool=True)
         elif self._generation != self._pool._generation:
             # Connections have been expired, re-connect the holder.
             self._pool._loop.create_task(
@@ -453,9 +456,10 @@ class Pool:
         self._working_config = None
         self._working_params = None
 
-    async def _get_new_connection(self):
-        if self._working_addr is None:
+    async def _get_new_connection(self, refresh_pool=False):
+        if self._working_addr is None or refresh_pool is True:
             # First connection attempt on this pool.
+            logging.debug("Attempting new connection.")
             con = await connection.connect(
                 *self._connect_args,
                 loop=self._loop,
@@ -465,10 +469,13 @@ class Pool:
             self._working_addr = con._addr
             self._working_config = con._config
             self._working_params = con._params
+            logging.debug("New connection resolved to %s.", con._addr)
 
         else:
             # We've connected before and have a resolved address,
             # and parsed options and config.
+            # Do we need to lock around these attributes in an async context?
+            logging.debug("Attempting cached connection to %s.", self._working_addr)
             con = await connect_utils._connect_addr(
                 loop=self._loop,
                 addr=self._working_addr,
